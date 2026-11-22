@@ -16,6 +16,10 @@
 > **Нужен лёгкий плагин прямо внутри IDE без оверлея?**  
 > Если плавающее кольцо поверх окна не требуется или нужна кроссплатформенность (macOS / Linux / Windows) со встроенной Sidecar-панелью и мгновенными 0-токенными командами `/чат` и `/ctx`, посмотри проект **[chat_tokens](https://github.com/vladsboev-web/chat_tokens)**.
 
+<div align="center">
+  <img src="assets/demo.gif" alt="Демонстрация интерфейса ContextRing" width="760" />
+</div>
+
 ---
 
 ## Скриншоты

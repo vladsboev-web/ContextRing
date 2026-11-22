@@ -16,6 +16,10 @@ Native macOS (Swift / AppKit / SwiftUI) floating context ring and menu bar monit
 > **Looking for a lightweight in-IDE plugin instead?**  
 > If you don't need a macOS floating overlay or want cross-platform support (macOS / Linux / Windows) with a Sidecar panel + instant 0-token `/ctx` and `/чат` commands inside Antigravity, see **[chat_tokens](https://github.com/vladsboev-web/chat_tokens)**.
 
+<div align="center">
+  <img src="assets/demo.gif" alt="ContextRing interactive preview" width="760" />
+</div>
+
 ---
 
 ## Screenshots
