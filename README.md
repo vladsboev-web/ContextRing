@@ -95,6 +95,26 @@ Native macOS (Swift / AppKit / SwiftUI) floating context ring and menu bar monit
 
 ## Installation
 
+### Via Homebrew (Recommended)
+
+```bash
+brew install --cask vladsboev-web/tap/contextring
+```
+
+Or add the tap once first:
+
+```bash
+brew tap vladsboev-web/tap
+brew install --cask contextring
+```
+
+Update / uninstall with Homebrew:
+
+```bash
+brew upgrade --cask contextring
+brew uninstall --cask contextring
+```
+
 ### Build & Install from Source
 
 ```bash

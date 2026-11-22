@@ -95,6 +95,26 @@
 
 ## Установка
 
+### Через Homebrew (рекомендуется)
+
+```bash
+brew install --cask vladsboev-web/tap/contextring
+```
+
+Или сначала подключить tap отдельно:
+
+```bash
+brew tap vladsboev-web/tap
+brew install --cask contextring
+```
+
+Обновление и удаление через Homebrew:
+
+```bash
+brew upgrade --cask contextring
+brew uninstall --cask contextring
+```
+
 ### Сборка и установка из исходников
 
 ```bash
