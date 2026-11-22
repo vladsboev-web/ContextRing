@@ -35,6 +35,7 @@ final class AntigravityDataReader {
 
     private struct CachedTitleResolution {
         let rawTitle: String
+        let allowLatestFallback: Bool
         let dbStamp: DBCombinedStamp
         let result: (id: String, title: String)?
     }
@@ -922,6 +923,12 @@ final class AntigravityDataReader {
         self.userSettingsPath = home.appendingPathComponent("Library/Application Support/Antigravity/User/settings.json").path
     }
 
+    struct EmptyChatBaseline {
+        let enteredAt: Date
+        let knownDirIds: Set<String>
+        let knownTranscriptIds: Set<String>
+    }
+
     // MARK: - Watched File Paths
 
     var dbFilePath: String { dbPath }
@@ -932,6 +939,109 @@ final class AntigravityDataReader {
 
     func transcriptFilePath(forConversationId conversationId: String) -> String? {
         resolveTranscriptPath(conversationId: conversationId)
+    }
+
+    func watchCandidatePaths(forConversationId conversationId: String) -> [String] {
+        let fm = FileManager.default
+        let convDir = brainDir.appendingPathComponent(conversationId)
+        let sysGenDir = convDir.appendingPathComponent(".system_generated")
+        let logsDir = sysGenDir.appendingPathComponent("logs")
+
+        var result: [String] = []
+        for path in [convDir.path, sysGenDir.path, logsDir.path] where fm.fileExists(atPath: path) {
+            result.append(path)
+        }
+        if let transcriptPath = resolveTranscriptPath(conversationId: conversationId),
+           fm.fileExists(atPath: transcriptPath) {
+            result.append(transcriptPath)
+        }
+        return result
+    }
+
+    func captureEmptyChatBaseline() -> EmptyChatBaseline {
+        let now = Date()
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: brainDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return EmptyChatBaseline(enteredAt: now, knownDirIds: [], knownTranscriptIds: [])
+        }
+
+        var dirIds = Set<String>()
+        var transcriptIds = Set<String>()
+        for dirURL in entries {
+            let convId = dirURL.lastPathComponent
+            guard Self.isValidConversationId(convId) else { continue }
+            dirIds.insert(convId)
+            if let tPath = resolveTranscriptPath(conversationId: convId),
+               let stamp = fileStamp(atPath: tPath),
+               stamp.fileSize > 0 {
+                transcriptIds.insert(convId)
+            }
+        }
+        return EmptyChatBaseline(enteredAt: now, knownDirIds: dirIds, knownTranscriptIds: transcriptIds)
+    }
+
+    func findNewConversation(since baseline: EmptyChatBaseline) -> String? {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: brainDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        var withNewTranscript: [(id: String, date: Date)] = []
+        var brandNewDir: [(id: String, date: Date)] = []
+
+        for dirURL in entries {
+            let convId = dirURL.lastPathComponent
+            guard Self.isValidConversationId(convId) else { continue }
+
+            if !baseline.knownTranscriptIds.contains(convId),
+               let tPath = resolveTranscriptPath(conversationId: convId),
+               let stamp = fileStamp(atPath: tPath),
+               stamp.fileSize > 0 {
+                withNewTranscript.append((convId, stamp.modificationDate ?? Date.distantPast))
+            } else if !baseline.knownDirIds.contains(convId) {
+                let dirDate = fileStamp(atPath: dirURL.path)?.modificationDate ?? Date.distantPast
+                brandNewDir.append((convId, dirDate))
+            }
+        }
+
+        if let newest = withNewTranscript.max(by: { $0.date < $1.date }) {
+            return newest.id
+        }
+        return brandNewDir.max(by: { $0.date < $1.date })?.id
+    }
+
+    func pendingEmptyChatWatchPaths(since baseline: EmptyChatBaseline) -> [String] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: brainDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        var candidates: [(id: String, date: Date)] = []
+        for dirURL in entries {
+            let convId = dirURL.lastPathComponent
+            guard Self.isValidConversationId(convId),
+                  !baseline.knownTranscriptIds.contains(convId) else {
+                continue
+            }
+            let dirDate = fileStamp(atPath: dirURL.path)?.modificationDate ?? Date.distantPast
+            candidates.append((convId, dirDate))
+        }
+
+        candidates.sort { $0.date > $1.date }
+        var paths: [String] = []
+        for item in candidates.prefix(5) {
+            paths.append(contentsOf: watchCandidatePaths(forConversationId: item.id))
+        }
+        return paths
     }
 
     func watchedFilePaths(forConversationId conversationId: String?) -> [String] {
@@ -950,35 +1060,93 @@ final class AntigravityDataReader {
 
     // MARK: - Public API
 
-    func resolveConversationId(forWindowTitle rawTitle: String) -> (id: String, title: String)? {
+    func resolveConversationId(forWindowTitle rawTitle: String, allowLatestFallback: Bool = false) -> (id: String, title: String)? {
         let trimmed = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isGenericTitle = trimmed.isEmpty || trimmed.caseInsensitiveCompare("Antigravity") == .orderedSame
+        let isGenericOrNewChat = Self.isGenericOrNewChatTitle(trimmed)
         let dbStamp = currentDBStamp()
 
         if let cached = cachedTitleResolution,
            cached.rawTitle == trimmed,
+           cached.allowLatestFallback == allowLatestFallback,
            cached.dbStamp == dbStamp,
-           (!isGenericTitle || cached.result != nil) {
+           (!isGenericOrNewChat || !allowLatestFallback || cached.result != nil) {
             return cached.result
         }
 
-        let candidates = isGenericTitle ? [] : buildTitleCandidates(from: trimmed)
-        let dbMatch = queryConversationSummaries(candidates: candidates, allowLatestFallback: isGenericTitle)
-
-        if let dbMatch {
-            cachedTitleResolution = CachedTitleResolution(rawTitle: trimmed, dbStamp: dbStamp, result: dbMatch)
-            return dbMatch
-        }
-
-        if !isGenericTitle {
-            cachedTitleResolution = CachedTitleResolution(rawTitle: trimmed, dbStamp: dbStamp, result: nil)
+        if isGenericOrNewChat {
+            guard allowLatestFallback else {
+                cachedTitleResolution = CachedTitleResolution(
+                    rawTitle: trimmed,
+                    allowLatestFallback: allowLatestFallback,
+                    dbStamp: dbStamp,
+                    result: nil
+                )
+                return nil
+            }
+            if let dbMatch = queryConversationSummaries(candidates: [], allowLatestFallback: true) {
+                cachedTitleResolution = CachedTitleResolution(
+                    rawTitle: trimmed,
+                    allowLatestFallback: allowLatestFallback,
+                    dbStamp: dbStamp,
+                    result: dbMatch
+                )
+                return dbMatch
+            }
+            if let latestId = findNewestTranscriptInBrain() {
+                return (latestId, "")
+            }
             return nil
         }
 
-        if let latestId = findNewestTranscriptInBrain() {
-            return (latestId, "")
+        let candidates = buildTitleCandidates(from: trimmed)
+        let dbMatch = queryConversationSummaries(candidates: candidates, allowLatestFallback: false)
+
+        if let dbMatch {
+            cachedTitleResolution = CachedTitleResolution(
+                rawTitle: trimmed,
+                allowLatestFallback: allowLatestFallback,
+                dbStamp: dbStamp,
+                result: dbMatch
+            )
+            return dbMatch
         }
+
+        cachedTitleResolution = CachedTitleResolution(
+            rawTitle: trimmed,
+            allowLatestFallback: allowLatestFallback,
+            dbStamp: dbStamp,
+            result: nil
+        )
         return nil
+    }
+
+    private static func isGenericOrNewChatTitle(_ trimmed: String) -> Bool {
+        if trimmed.isEmpty {
+            return true
+        }
+        let markers: Set<String> = [
+            "antigravity",
+            "new chat",
+            "new conversation",
+            "start a new conversation",
+            "новый чат",
+            "новая беседа",
+            "agent manager",
+            "inbox",
+            "untitled",
+        ]
+        if markers.contains(trimmed.lowercased()) {
+            return true
+        }
+        for sep in [" - ", " — "] {
+            if let range = trimmed.range(of: sep) {
+                let prefix = String(trimmed[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if markers.contains(prefix) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     static func cleanWindowTitle(_ rawTitle: String) -> String {

@@ -40,6 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var fileWatchers: [String: (fd: Int32, source: DispatchSourceFileSystemObject)] = [:]
     private var fileEventWorkItem: DispatchWorkItem?
     private var activeConversationId: String?
+    private var emptyChatBaseline: AntigravityDataReader.EmptyChatBaseline?
+    private var boundNewConversationId: String?
 
     private var hoverWorkItem: DispatchWorkItem?
     private var globalClickMonitor: Any?
@@ -405,15 +407,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if let convId = activeConversationId {
-            if let transcriptPath = dataReader.transcriptFilePath(forConversationId: convId) {
-                desiredPaths.insert(transcriptPath)
-            } else {
-                let logsDir = URL(fileURLWithPath: dataReader.brainDirectoryPath)
-                    .appendingPathComponent(convId)
-                    .appendingPathComponent(".system_generated/logs").path
-                if fm.fileExists(atPath: logsDir) {
-                    desiredPaths.insert(logsDir)
-                }
+            for path in dataReader.watchCandidatePaths(forConversationId: convId) {
+                desiredPaths.insert(path)
+            }
+        } else if let baseline = emptyChatBaseline {
+            for path in dataReader.pendingEmptyChatWatchPaths(since: baseline) {
+                desiredPaths.insert(path)
             }
         }
 
@@ -476,6 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func handleFileSystemEvent() {
         guard isMonitoringActive else { return }
+        windowTracker.refresh()
         refreshData(includeRecentList: viewModel.isDetailOpen || viewModel.isChatDropdownOpen)
         if viewModel.isDetailOpen && viewModel.activeDetailTab == .stats {
             refreshPeriodStats()
@@ -780,8 +780,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 viewModel.isFullScreen = snapshot.isFullScreen
             }
 
-            if !snapshot.title.isEmpty && snapshot.title != lastAntigravityWindowTitle {
+            if snapshot.title != lastAntigravityWindowTitle {
                 lastAntigravityWindowTitle = snapshot.title
+                emptyChatBaseline = nil
+                boundNewConversationId = nil
                 if viewModel.manualConversationId != nil {
                     viewModel.manualConversationId = nil
                 }
@@ -890,11 +892,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 applyStatsToViewModel(stats: nil, activeTitle: fallback, hasData: false)
             }
         } else {
-            let titleHint = !viewModel.activeWindowTitle.isEmpty
-                ? viewModel.activeWindowTitle
-                : (lastKnownAntigravitySnapshot?.title ?? "")
+            let titleHint: String
+            if let lastSnapshot, lastSnapshot.isVisible {
+                titleHint = lastSnapshot.title
+            } else if !viewModel.activeWindowTitle.isEmpty {
+                titleHint = viewModel.activeWindowTitle
+            } else {
+                titleHint = lastKnownAntigravitySnapshot?.title ?? ""
+            }
 
-            if let resolved = dataReader.resolveConversationId(forWindowTitle: titleHint) {
+            if let resolved = dataReader.resolveConversationId(
+                forWindowTitle: titleHint,
+                allowLatestFallback: !viewModel.accessibilityGranted
+            ) {
+                emptyChatBaseline = nil
+                boundNewConversationId = nil
                 activeConversationId = resolved.id
                 if let stats = dataReader.readTranscriptStats(conversationId: resolved.id, fallbackTitle: resolved.title),
                    stats.totalModelSteps > 0 {
@@ -906,12 +918,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     applyStatsToViewModel(stats: nil, activeTitle: fallback, hasData: false)
                 }
             } else {
-                activeConversationId = nil
-                applyStatsToViewModel(
-                    stats: nil,
-                    activeTitle: AntigravityDataReader.cleanWindowTitle(titleHint),
-                    hasData: false
-                )
+                if emptyChatBaseline == nil {
+                    emptyChatBaseline = dataReader.captureEmptyChatBaseline()
+                }
+                if let baseline = emptyChatBaseline,
+                   let newConvId = boundNewConversationId ?? dataReader.findNewConversation(since: baseline) {
+                    boundNewConversationId = newConvId
+                    activeConversationId = newConvId
+                    if let stats = dataReader.readTranscriptStats(conversationId: newConvId, fallbackTitle: ""),
+                       stats.totalModelSteps > 0 {
+                        applyStatsToViewModel(stats: stats, activeTitle: stats.title, hasData: true)
+                    } else {
+                        applyStatsToViewModel(
+                            stats: nil,
+                            activeTitle: AntigravityDataReader.cleanWindowTitle(titleHint),
+                            hasData: false
+                        )
+                    }
+                } else {
+                    activeConversationId = nil
+                    applyStatsToViewModel(
+                        stats: nil,
+                        activeTitle: AntigravityDataReader.cleanWindowTitle(titleHint),
+                        hasData: false
+                    )
+                }
             }
         }
 
