@@ -31,28 +31,9 @@ final class HoverTooltipPanel: NSPanel {
     func show(near ringFrame: CGRect) {
         hostingView.layoutSubtreeIfNeeded()
         let size = hostingView.fittingSize
-        let origin = calculateOrigin(for: size, near: ringFrame)
+        let origin = OverlayPositioning.popupOrigin(for: size, near: ringFrame, gap: 8, horizontalOverlap: 0, inset: 8)
         setFrame(CGRect(origin: origin, size: size), display: true)
         orderFrontRegardless()
-    }
-
-    private func calculateOrigin(for size: CGSize, near ringFrame: CGRect) -> CGPoint {
-        let screen = NSScreen.screens.first(where: { $0.frame.intersects(ringFrame) }) ?? NSScreen.main
-        let bounds = screen?.frame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
-        let inset: CGFloat = 8
-        let gap: CGFloat = 8
-
-        var y = ringFrame.maxY + gap
-        if y + size.height > bounds.maxY - inset {
-            y = ringFrame.minY - size.height - gap
-        }
-        y = min(max(y, bounds.minY + inset), bounds.maxY - size.height - inset)
-
-        let preferRightAlign = ringFrame.midX > bounds.midX
-        var x = preferRightAlign ? (ringFrame.maxX - size.width) : ringFrame.minX
-        x = min(max(x, bounds.minX + inset), bounds.maxX - size.width - inset)
-
-        return CGPoint(x: x, y: y)
     }
 }
 
@@ -71,25 +52,14 @@ struct HoverTooltipView: View {
         viewModel.effectiveIsDarkTheme
     }
 
-    private var surfaceBg: Color {
-        darkTheme
-            ? Color(red: 0.13, green: 0.14, blue: 0.16).opacity(0.96)
-            : Color.white.opacity(0.97)
+    private var palette: OverlayPalette {
+        viewModel.palette
     }
 
-    private var borderStroke: Color {
-        darkTheme
-            ? Color.white.opacity(0.14)
-            : Color.black.opacity(0.11)
-    }
-
-    private var primaryText: Color {
-        darkTheme ? Color(white: 0.94) : Color(white: 0.10)
-    }
-
-    private var secondaryText: Color {
-        darkTheme ? Color(white: 0.64) : Color(white: 0.44)
-    }
+    private var surfaceBg: Color { palette.tooltipSurfaceBg }
+    private var borderStroke: Color { palette.borderStroke }
+    private var primaryText: Color { palette.primaryText }
+    private var secondaryText: Color { palette.secondaryText }
 
     private var chatTitle: String {
         if !viewModel.activeChatTitle.isEmpty {
@@ -122,20 +92,31 @@ struct HoverTooltipView: View {
                     .clipShape(Capsule())
             }
 
+            if viewModel.hasTokenData {
+                let scopeLabel = L10n.hoverScopeBadge(scope: viewModel.effectiveScope, stats: viewModel.stats, lang: lang)
+                if !scopeLabel.isEmpty {
+                    Text(scopeLabel)
+                        .font(.system(size: 11 * s, weight: .medium))
+                        .foregroundColor(secondaryText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+
             HStack(spacing: 6 * s) {
-                if viewModel.hasTokenData, let stats = viewModel.stats {
-                    Text("\(RingViewModel.formatNumber(stats.contextTokens)) / \(RingViewModel.formatLimit(viewModel.threshold))")
+                if viewModel.hasTokenData, let scoped = viewModel.activeScopedSnapshot {
+                    Text("\(RingViewModel.formatNumber(scoped.contextTokens)) / \(RingViewModel.formatLimit(viewModel.threshold))")
                         .font(.system(size: 12.5 * s, weight: .medium, design: .monospaced))
                         .foregroundColor(primaryText)
 
-                    if stats.totalModelSteps > 0 {
+                    if scoped.totalModelSteps > 0 {
                         Text("(\(viewModel.formattedDelta))")
                             .font(.system(size: 11.5 * s, design: .monospaced))
                             .foregroundColor(secondaryText)
                     }
 
-                    if stats.compactionEvents > 0 {
-                        Text(L10n.compactionsBadge(stats.compactionEvents, lang: lang))
+                    if scoped.compactionEvents > 0 {
+                        Text(L10n.compactionsBadge(scoped.compactionEvents, lang: lang))
                             .font(.system(size: 11 * s, weight: .semibold))
                             .foregroundColor(ContextZone.amber.accentColor)
                             .padding(.horizontal, 5 * s)

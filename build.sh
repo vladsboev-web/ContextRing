@@ -7,14 +7,15 @@ MACOS_DIR="$APP_DIR/Contents/MacOS"
 RESOURCES_DIR="$APP_DIR/Contents/Resources"
 SIGN_IDENTITY="${SIGN_IDENTITY:-ContextRing Local Signing}"
 
-UNIVERSAL=false
+UNIVERSAL=true
 
 usage() {
   cat <<'EOF'
-Usage: ./build.sh [--universal] [-h|--help]
+Usage: ./build.sh [--universal | --native] [-h|--help]
 
 Options:
-  --universal   Build a Universal Binary (x86_64 + arm64)
+  --universal   Build a Universal Binary (x86_64 + arm64) (default)
+  --native      Build only for the current host architecture
   -h, --help    Show this help message
 EOF
 }
@@ -23,6 +24,10 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --universal)
       UNIVERSAL=true
+      shift
+      ;;
+    --native)
+      UNIVERSAL=false
       shift
       ;;
     -h|--help)
@@ -69,9 +74,14 @@ else
 fi
 
 cp "$ROOT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+if [ -f "$ROOT_DIR/Resources/AppIcon.icns" ]; then
+  cp "$ROOT_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+fi
 
 if security find-identity -v -p codesigning 2>/dev/null | grep -Fq "\"$SIGN_IDENTITY\""; then
-  codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_DIR"
+  codesign --force --deep \
+    -r="designated => identifier \"com.vladsboev.contextring\" and certificate leaf[subject.CN] = \"$SIGN_IDENTITY\"" \
+    --sign "$SIGN_IDENTITY" "$APP_DIR"
   echo "Signed with local certificate: $SIGN_IDENTITY"
 else
   codesign --force --deep --sign - "$APP_DIR"

@@ -13,8 +13,14 @@ enum ResolvedLanguage: String {
     case en
 
     static func systemDefault() -> ResolvedLanguage {
-        let preferred = Locale.preferredLanguages.first?.lowercased() ?? "en"
-        return preferred.hasPrefix("ru") ? .ru : .en
+        if let preferred = Locale.preferredLanguages.first?.lowercased(), !preferred.isEmpty {
+            return preferred.hasPrefix("ru") ? .ru : .en
+        }
+        if let appleLangs = UserDefaults.standard.stringArray(forKey: "AppleLanguages"),
+           let first = appleLangs.first?.lowercased(), !first.isEmpty {
+            return first.hasPrefix("ru") ? .ru : .en
+        }
+        return .en
     }
 }
 
@@ -229,16 +235,49 @@ enum L10n {
         lang == .ru ? "Система и правила" : "System & rules"
     }
 
-    static func segmentTools(_ lang: ResolvedLanguage) -> String {
-        lang == .ru ? "Инструменты и файлы" : "Tools & files"
+    static func subBasePrompt(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Базовый промпт и правила" : "Base prompt & rules"
+    }
+
+    static func subSystemMessages(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Системные сообщения" : "System messages"
+    }
+
+    static func subConversationHistory(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Память прошлых чатов" : "Conversation history"
+    }
+
+    static func subCheckpointSummary(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Сводка после сжатия" : "Compaction summary"
+    }
+
+    static func segmentFiles(_ count: Int, lang: ResolvedLanguage) -> String {
+        if lang == .ru {
+            return count > 0 ? "Файлы в контексте (\(count))" : "Файлы в контексте"
+        }
+        return count > 0 ? "Files in context (\(count))" : "Files in context"
+    }
+
+    static func segmentToolsWithCount(_ count: Int, lang: ResolvedLanguage) -> String {
+        if lang == .ru {
+            return count > 0 ? "Инструменты и команды (\(count))" : "Инструменты и команды"
+        }
+        return count > 0 ? "Tools & commands (\(count))" : "Tools & commands"
     }
 
     static func segmentAssistant(_ lang: ResolvedLanguage) -> String {
-        lang == .ru ? "Ответы и мысли" : "Assistant & thinking"
+        lang == .ru ? "Ответы модели" : "Model responses"
     }
 
-    static func segmentUser(_ lang: ResolvedLanguage) -> String {
-        lang == .ru ? "Сообщения" : "User messages"
+    static func segmentThinking(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Рассуждения (Thinking)" : "Thinking"
+    }
+
+    static func segmentUserWithMedia(_ mediaCount: Int, lang: ResolvedLanguage) -> String {
+        if mediaCount > 0 {
+            return lang == .ru ? "Сообщения (\(mediaCount) влож.)" : "User messages (\(mediaCount) media)"
+        }
+        return lang == .ru ? "Сообщения" : "User messages"
     }
 
     static func outputAndToolsFooter(outputK: String, toolCalls: Int, toolsTail: String, lang: ResolvedLanguage) -> String {
@@ -250,6 +289,85 @@ enum L10n {
 
     static func metricPrimaryModel(_ lang: ResolvedLanguage) -> String {
         lang == .ru ? "Основная модель" : "Primary model"
+    }
+
+    static func metricModelSingle(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Модель" : "Model"
+    }
+
+    static func scopeAllChat(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Весь чат" : "All chat"
+    }
+
+    static func scopeGroupManual(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Ручной режим" : "Manual"
+    }
+
+    static func scopeGroupOrchestrator(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Оркестратор" : "Orchestrator"
+    }
+
+    static func scopeAllInGroup(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Общее" : "All"
+    }
+
+    static func scopeOrchestratorPlanner(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Оркестр" : "Planner"
+    }
+
+    static func scopeOrchestratorExecutor(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Исполнитель" : "Executor"
+    }
+
+    static func hoverScopeBadge(scope: ChatStatsScope, stats: TranscriptStats?, lang: ResolvedLanguage) -> String {
+        guard let stats else { return "" }
+        let scoped = stats.snapshot(for: scope)
+        let modelName = !scoped.model.isEmpty ? scoped.model : scoped.sessionStats.primaryModel
+        let short = RingViewModel.shortModelName(modelName)
+
+        switch scope {
+        case .allChat:
+            if stats.hasOrchestratorMode && !stats.hasManualMode {
+                return short.isEmpty
+                    ? "\(scopeGroupOrchestrator(lang)) · \(scopeAllInGroup(lang))"
+                    : "\(scopeGroupOrchestrator(lang)) · \(scopeAllInGroup(lang)) (\(short))"
+            }
+            if stats.hasManualMode && !stats.hasOrchestratorMode {
+                if short.isEmpty {
+                    return scopeGroupManual(lang)
+                }
+                if scoped.sessionStats.otherModelsCount > 0 {
+                    return "\(scopeGroupManual(lang)) · \(short) (+\(scoped.sessionStats.otherModelsCount))"
+                }
+                return "\(scopeGroupManual(lang)) · \(short)"
+            }
+            if short.isEmpty {
+                return scopeAllChat(lang)
+            }
+            if scoped.sessionStats.otherModelsCount > 0 {
+                return "\(scopeAllChat(lang)) · \(short) (+\(scoped.sessionStats.otherModelsCount))"
+            }
+            return "\(scopeAllChat(lang)) · \(short)"
+        case .manualAll:
+            if short.isEmpty {
+                return "\(scopeGroupManual(lang)) · \(scopeAllInGroup(lang))"
+            }
+            return "\(scopeGroupManual(lang)) · \(scopeAllInGroup(lang)) (\(short))"
+        case .manualModel(let key):
+            let itemShort = stats.manualModels.first(where: { $0.id == key })?.shortName ?? short
+            let label = !itemShort.isEmpty ? itemShort : short
+            return label.isEmpty ? scopeGroupManual(lang) : "\(scopeGroupManual(lang)) · \(label)"
+        case .orchestratorAll:
+            return "\(scopeGroupOrchestrator(lang)) · \(scopeAllInGroup(lang))"
+        case .orchestratorPlanner:
+            return short.isEmpty
+                ? "\(scopeGroupOrchestrator(lang)) · \(scopeOrchestratorPlanner(lang))"
+                : "\(scopeGroupOrchestrator(lang)) · \(scopeOrchestratorPlanner(lang)) (\(short))"
+        case .orchestratorExecutor:
+            return short.isEmpty
+                ? "\(scopeGroupOrchestrator(lang)) · \(scopeOrchestratorExecutor(lang))"
+                : "\(scopeGroupOrchestrator(lang)) · \(scopeOrchestratorExecutor(lang)) (\(short))"
+        }
     }
 
     static func metricLastDelta(_ mode: HistoryViewMode, lang: ResolvedLanguage) -> String {
@@ -268,6 +386,14 @@ enum L10n {
         case (.steps, .ru): return "Кэш (посл. шаг)"
         case (.steps, .en): return "Cache (last step)"
         }
+    }
+
+    static func metricCacheCombined(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Кэш (посл. / ср.)" : "Cache (last / avg)"
+    }
+
+    static func metricInputOutput(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Вход + Вывод" : "Input + Output"
     }
 
     static func metricCountPeak(_ mode: HistoryViewMode, lang: ResolvedLanguage) -> String {
@@ -309,6 +435,14 @@ enum L10n {
 
     static func compactedPill(_ lang: ResolvedLanguage) -> String {
         lang == .ru ? "⚡ сжатие" : "⚡ compacted"
+    }
+
+    static func modelSwitchPill(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "⇄ модель" : "⇄ model"
+    }
+
+    static func effortSwitchPill(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "⇄ уровень" : "⇄ effort"
     }
 
     static func noModelStepsYet(_ lang: ResolvedLanguage) -> String {
@@ -365,6 +499,50 @@ enum L10n {
         lang == .ru ? "Все чаты" : "All chats"
     }
 
+    static func statsPeriodHeader(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Все чаты за период" : "All chats in period"
+    }
+
+    static func statsChatsAndMessages(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Чатов / Сообщений" : "Chats / Messages"
+    }
+
+    static func statsActiveTime(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Активное время" : "Active time"
+    }
+
+    static func statsPeriodActivityTitle(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Активность за период" : "Period activity"
+    }
+
+    static func statsPeriodModels(_ count: Int, lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Модели за период (\(count))" : "Models in period (\(count))"
+    }
+
+    static func statsPeriodFiles(_ count: Int, lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Файлы за период (\(count))" : "Files in period (\(count))"
+    }
+
+    static func statsPeriodTools(_ count: Int, lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Инструменты за период (\(count))" : "Tools in period (\(count))"
+    }
+
+    static func statsPeriodChats(_ count: Int, lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Активные чаты (\(count))" : "Active chats (\(count))"
+    }
+
+    static func statsTouchesShort(_ count: Int, lang: ResolvedLanguage) -> String {
+        lang == .ru ? "\(count) обр." : "\(count) refs"
+    }
+
+    static func statsCallsShort(_ count: Int, lang: ResolvedLanguage) -> String {
+        lang == .ru ? "\(count) выз." : "\(count) calls"
+    }
+
+    static func statsPeakShort(_ peakK: String, lang: ResolvedLanguage) -> String {
+        lang == .ru ? "пик \(peakK)" : "peak \(peakK)"
+    }
+
     static func statsActiveChats(_ lang: ResolvedLanguage) -> String {
         lang == .ru ? "Активных чатов" : "Active chats"
     }
@@ -404,11 +582,15 @@ enum L10n {
 
     static func menuWindow(isFullScreen: Bool, zoom: String, lang: ResolvedLanguage) -> String {
         if lang == .ru {
-            let mode = isFullScreen ? "Fullscreen" : "Обычное"
+            let mode = isFullScreen ? "Полный экран" : "Обычное"
             return "Окно: \(mode) · Zoom: \(zoom)"
         }
         let mode = isFullScreen ? "Fullscreen" : "Windowed"
         return "Window: \(mode) · Zoom: \(zoom)"
+    }
+
+    static func menuLanguage(_ lang: ResolvedLanguage) -> String {
+        lang == .ru ? "Язык" : "Language"
     }
 
     static func menuSettings(_ lang: ResolvedLanguage) -> String {
@@ -549,7 +731,7 @@ enum L10n {
     }
 
     static func settingsFullscreenAnchor(_ summary: String, lang: ResolvedLanguage) -> String {
-        "Fullscreen: \(summary)"
+        lang == .ru ? "Полный экран: \(summary)" : "Fullscreen: \(summary)"
     }
 
     static func settingsSnapToSendButton(_ lang: ResolvedLanguage) -> String {

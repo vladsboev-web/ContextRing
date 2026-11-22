@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import CoreGraphics
 import Foundation
@@ -9,6 +10,8 @@ struct ModelStepSample: Identifiable, Equatable {
     let contextTokens: Int
     let delta: Int
     let isCompaction: Bool
+    let isModelSwitch: Bool
+    let isEffortSwitch: Bool
 }
 
 struct MessageTurnSample: Identifiable, Equatable {
@@ -20,12 +23,27 @@ struct MessageTurnSample: Identifiable, Equatable {
     let cacheReadTokens: Int
     let cacheHitPercent: Int
     let hadCompaction: Bool
+    let hadModelSwitch: Bool
+    let hadEffortSwitch: Bool
 }
 
 struct ToolUsageCount: Identifiable, Equatable {
     var id: String { name }
     let name: String
     let count: Int
+}
+
+struct FileUsageCount: Identifiable, Equatable {
+    var id: String { name }
+    let name: String
+    let count: Int
+}
+
+struct PeriodChatItem: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let peakTokens: Int
+    let steps: Int
 }
 
 struct ModelUsageCount: Identifiable, Equatable {
@@ -66,50 +84,144 @@ struct ChatSessionStats: Equatable {
 struct PeriodUsageStats: Equatable {
     let windowHours: Int
     let activeChats: Int
+    let userMessages: Int
     let modelSteps: Int
+    let compactionEvents: Int
     let totalInputTokens: Int
     let totalCacheReadTokens: Int
     let totalOutputTokens: Int
     let avgCacheHitPercent: Int
+    let totalDurationSeconds: Int
+    let totalToolCalls: Int
+    let totalFileTouches: Int
+    let peakTokens: Int
     let modelUsage: [ModelUsageCount]
+    let topTools: [ToolUsageCount]
+    let topFiles: [FileUsageCount]
+    let activeChatItems: [PeriodChatItem]
 
     static func empty(hours: Int) -> PeriodUsageStats {
         PeriodUsageStats(
             windowHours: hours,
             activeChats: 0,
+            userMessages: 0,
             modelSteps: 0,
+            compactionEvents: 0,
             totalInputTokens: 0,
             totalCacheReadTokens: 0,
             totalOutputTokens: 0,
             avgCacheHitPercent: 0,
-            modelUsage: []
+            totalDurationSeconds: 0,
+            totalToolCalls: 0,
+            totalFileTouches: 0,
+            peakTokens: 0,
+            modelUsage: [],
+            topTools: [],
+            topFiles: [],
+            activeChatItems: []
         )
     }
 }
 
 struct ContextBreakdown: Equatable {
     let systemTokens: Int
+    let basePromptTokens: Int
+    let systemMessageTokens: Int
+    let historyTokens: Int
+    let checkpointSummaryTokens: Int
+    let filesTokens: Int
     let toolsTokens: Int
     let assistantTokens: Int
+    let thinkingTokens: Int
     let userTokens: Int
     let totalOutputTokens: Int
     let userTurns: Int
+    let mediaCount: Int
     let toolCallsCount: Int
+    let fileTouchesCount: Int
     let topTools: [ToolUsageCount]
+    let topFiles: [FileUsageCount]
 
     static let empty = ContextBreakdown(
         systemTokens: 0,
+        basePromptTokens: 0,
+        systemMessageTokens: 0,
+        historyTokens: 0,
+        checkpointSummaryTokens: 0,
+        filesTokens: 0,
         toolsTokens: 0,
         assistantTokens: 0,
+        thinkingTokens: 0,
         userTokens: 0,
         totalOutputTokens: 0,
         userTurns: 0,
+        mediaCount: 0,
         toolCallsCount: 0,
-        topTools: []
+        fileTouchesCount: 0,
+        topTools: [],
+        topFiles: []
     )
 }
 
-struct TranscriptStats {
+enum ChatScopeGroup: String, Equatable, Identifiable {
+    case allChat
+    case manual
+    case orchestrator
+
+    var id: String { rawValue }
+}
+
+enum ChatStatsScope: Equatable, Hashable {
+    case allChat
+    case manualAll
+    case manualModel(String)
+    case orchestratorAll
+    case orchestratorPlanner
+    case orchestratorExecutor
+
+    var group: ChatScopeGroup {
+        switch self {
+        case .allChat: return .allChat
+        case .manualAll, .manualModel: return .manual
+        case .orchestratorAll, .orchestratorPlanner, .orchestratorExecutor: return .orchestrator
+        }
+    }
+
+    var isAggregateScope: Bool {
+        switch self {
+        case .allChat, .manualAll, .orchestratorAll:
+            return true
+        case .manualModel, .orchestratorPlanner, .orchestratorExecutor:
+            return false
+        }
+    }
+}
+
+struct ManualModelScopeItem: Identifiable, Equatable {
+    let id: String
+    let shortName: String
+    let fullName: String
+    let steps: Int
+}
+
+struct ScopedStatsSnapshot: Equatable {
+    let contextTokens: Int
+    let lastInputTokens: Int
+    let lastCacheReadTokens: Int
+    let lastOutputTokens: Int
+    let lastDelta: Int
+    let cacheHitPercent: Int
+    let model: String
+    let totalModelSteps: Int
+    let peakTokens: Int
+    let compactionEvents: Int
+    let recentSteps: [ModelStepSample]
+    let recentMessages: [MessageTurnSample]
+    let breakdown: ContextBreakdown
+    let sessionStats: ChatSessionStats
+}
+
+struct TranscriptStats: Equatable {
     let conversationId: String
     let title: String
     let contextTokens: Int
@@ -126,7 +238,33 @@ struct TranscriptStats {
     let recentMessages: [MessageTurnSample]
     let breakdown: ContextBreakdown
     let sessionStats: ChatSessionStats
+    let hasManualMode: Bool
+    let hasOrchestratorMode: Bool
+    let manualModels: [ManualModelScopeItem]
+    let scopedSnapshots: [ChatStatsScope: ScopedStatsSnapshot]
     let updatedAt: Date?
+
+    func snapshot(for scope: ChatStatsScope) -> ScopedStatsSnapshot {
+        if let hit = scopedSnapshots[scope] {
+            return hit
+        }
+        return ScopedStatsSnapshot(
+            contextTokens: contextTokens,
+            lastInputTokens: lastInputTokens,
+            lastCacheReadTokens: lastCacheReadTokens,
+            lastOutputTokens: lastOutputTokens,
+            lastDelta: lastDelta,
+            cacheHitPercent: cacheHitPercent,
+            model: model,
+            totalModelSteps: totalModelSteps,
+            peakTokens: peakTokens,
+            compactionEvents: compactionEvents,
+            recentSteps: recentSteps,
+            recentMessages: recentMessages,
+            breakdown: breakdown,
+            sessionStats: sessionStats
+        )
+    }
 }
 
 struct RecentConversationItem: Identifiable, Equatable {
@@ -217,12 +355,12 @@ struct AbsoluteAnchor: Codable, Equatable {
     var y: Double
 }
 
-struct AntigravityAppState {
+struct AntigravityAppState: Equatable {
     let zoomLevel: Double
     let isDarkTheme: Bool
 }
 
-struct WindowSnapshot {
+struct WindowSnapshot: Equatable {
     let frame: CGRect
     let title: String
     let isFullScreen: Bool
@@ -234,6 +372,7 @@ final class RingViewModel: ObservableObject {
     static let thresholdPresets = [128_000, 160_000, 200_000, 256_000, 1_000_000]
 
     @Published var stats: TranscriptStats?
+    @Published var selectedScope: ChatStatsScope = .allChat
     @Published var activeChatTitle: String = ""
     @Published var hasTokenData: Bool = false
     @Published var threshold: Int = 200_000
@@ -296,6 +435,10 @@ final class RingViewModel: ObservableObject {
         }
     }
 
+    var palette: OverlayPalette {
+        OverlayPalette(isDark: effectiveIsDarkTheme)
+    }
+
     var uiScale: CGFloat {
         guard scaleWithAntigravityZoom else { return 1.0 }
         let factor = pow(1.2, zoomLevel - referenceZoomLevel)
@@ -325,8 +468,21 @@ final class RingViewModel: ObservableObject {
         min(max(detailFontScale * uiScale, 0.75), 2.1)
     }
 
+    var effectiveScope: ChatStatsScope {
+        guard let stats else { return .allChat }
+        if stats.scopedSnapshots[selectedScope] != nil {
+            return selectedScope
+        }
+        return .allChat
+    }
+
+    var activeScopedSnapshot: ScopedStatsSnapshot? {
+        guard hasTokenData, let stats else { return nil }
+        return stats.snapshot(for: effectiveScope)
+    }
+
     var contextTokens: Int {
-        hasTokenData ? (stats?.contextTokens ?? 0) : 0
+        activeScopedSnapshot?.contextTokens ?? 0
     }
 
     var progress: Double {
@@ -353,14 +509,106 @@ final class RingViewModel: ObservableObject {
     }
 
     var formattedDelta: String {
-        guard hasTokenData, let stats, stats.totalModelSteps > 0 else { return "—" }
+        guard hasTokenData, let scoped = activeScopedSnapshot, scoped.totalModelSteps > 0 else { return "—" }
         let val: Int
-        if historyViewMode == .messages, let lastTurn = stats.recentMessages.first {
+        if historyViewMode == .messages, let lastTurn = scoped.recentMessages.first {
             val = lastTurn.delta
         } else {
-            val = stats.lastDelta
+            val = scoped.lastDelta
         }
         return Self.formatSignedNumber(val)
+    }
+
+    static func formatModelDisplay(_ raw: String) -> (name: String, effort: String?) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return ("", nil) }
+
+        var work = trimmed
+        var effort: String? = nil
+
+        let effortPatterns = [
+            #"\s*\((x?high|medium|low)\)\s*$"#,
+            #"-(x?high|medium|low)$"#,
+            #"\s+(x?high|medium|low)$"#,
+        ]
+        for pattern in effortPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+                let nsRange = NSRange(location: 0, length: work.utf16.count)
+                if let match = regex.firstMatch(in: work, options: [], range: nsRange),
+                   match.numberOfRanges >= 2,
+                   let tokenRange = Range(match.range(at: 1), in: work),
+                   let fullRange = Range(match.range(at: 0), in: work) {
+                    let rawEffort = work[tokenRange].lowercased()
+                    switch rawEffort {
+                    case "xhigh": effort = "XHigh"
+                    case "high": effort = "High"
+                    case "medium": effort = "Medium"
+                    case "low": effort = "Low"
+                    default: break
+                    }
+                    work.removeSubrange(fullRange)
+                    work = work.trimmingCharacters(in: .whitespacesAndNewlines)
+                    break
+                }
+            }
+        }
+
+        if let orchRegex = try? NSRegularExpression(pattern: #"^orchestrator\s*\(([^)]+)\)$"#, options: [.caseInsensitive]) {
+            let nsRange = NSRange(location: 0, length: work.utf16.count)
+            if let match = orchRegex.firstMatch(in: work, options: [], range: nsRange),
+               match.numberOfRanges >= 2,
+               let innerRange = Range(match.range(at: 1), in: work) {
+                work = String(work[innerRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        work = work
+            .replacingOccurrences(of: "(", with: " ")
+            .replacingOccurrences(of: ")", with: " ")
+
+        while let range = work.range(of: #"(?<=\d)-(?=\d)"#, options: .regularExpression) {
+            work.replaceSubrange(range, with: ".")
+        }
+
+        let rawTokens = work
+            .components(separatedBy: CharacterSet(charactersIn: "-_ \t\n"))
+            .filter { !$0.isEmpty }
+
+        let dropTokens: Set<String> = ["gemini", "claude", "anthropic", "google", "agy", "orchestrator", "worker"]
+        let filtered = rawTokens.filter { !dropTokens.contains($0.lowercased()) }
+        let chosen = filtered.isEmpty ? rawTokens : filtered
+
+        let formattedTokens = chosen.map { tok -> String in
+            if tok == tok.lowercased(), tok.rangeOfCharacter(from: .letters) != nil {
+                return tok.prefix(1).uppercased() + tok.dropFirst()
+            }
+            return tok
+        }
+
+        let cleanName = formattedTokens.joined(separator: " ")
+        return (cleanName.isEmpty ? trimmed : cleanName, effort)
+    }
+
+    static func shortModelName(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let lower = trimmed.lowercased()
+
+        let known: [(token: String, label: String)] = [
+            ("opus", "Opus"),
+            ("sonnet", "Sonnet"),
+            ("haiku", "Haiku"),
+            ("argon", "Argon"),
+            ("hydrogen", "Hydrogen"),
+            ("neon", "Neon"),
+            ("flash", "Flash"),
+            ("pro", "Pro"),
+        ]
+        for entry in known where lower.contains(entry.token) {
+            return entry.label
+        }
+
+        return formatModelDisplay(trimmed).name
     }
 
     static func formatNumber(_ value: Int) -> String {
@@ -418,5 +666,86 @@ final class RingViewModel: ObservableObject {
         }
         let tokens = Int((num * multiplier).rounded())
         return min(max(tokens, 10_000), 10_000_000)
+    }
+}
+
+struct OverlayPalette {
+    let isDark: Bool
+
+    var surfaceBg: Color {
+        isDark
+            ? Color(red: 0.11, green: 0.12, blue: 0.14).opacity(0.98)
+            : Color(red: 0.98, green: 0.98, blue: 0.99).opacity(0.98)
+    }
+
+    var tooltipSurfaceBg: Color {
+        isDark
+            ? Color(red: 0.13, green: 0.14, blue: 0.16).opacity(0.96)
+            : Color.white.opacity(0.97)
+    }
+
+    var cardBg: Color {
+        isDark
+            ? Color(red: 0.16, green: 0.17, blue: 0.20)
+            : Color.white
+    }
+
+    var dropdownCardBg: Color {
+        isDark
+            ? Color(red: 0.14, green: 0.15, blue: 0.18)
+            : Color.white
+    }
+
+    var mutedBg: Color {
+        isDark
+            ? Color.white.opacity(0.07)
+            : Color.black.opacity(0.05)
+    }
+
+    var borderStroke: Color {
+        isDark
+            ? Color.white.opacity(0.14)
+            : Color.black.opacity(0.11)
+    }
+
+    var primaryText: Color {
+        isDark ? Color(white: 0.95) : Color(white: 0.10)
+    }
+
+    var secondaryText: Color {
+        isDark ? Color(white: 0.62) : Color(white: 0.44)
+    }
+}
+
+enum OverlayPositioning {
+    static func screenBounds(near anchorRect: CGRect) -> CGRect {
+        let screen = NSScreen.screens.first(where: { $0.frame.intersects(anchorRect) }) ?? NSScreen.main
+        return screen?.frame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+    }
+
+    static func popupOrigin(
+        for size: CGSize,
+        near ringFrame: CGRect,
+        bounds: CGRect? = nil,
+        gap: CGFloat = 8,
+        horizontalOverlap: CGFloat = 0,
+        inset: CGFloat = 8
+    ) -> CGPoint {
+        let b = bounds ?? screenBounds(near: ringFrame)
+        var y = ringFrame.maxY + gap
+        if y + size.height > b.maxY - inset {
+            let belowY = ringFrame.minY - size.height - gap
+            if belowY >= b.minY + inset || gap >= 8 {
+                y = belowY
+            }
+        }
+        y = min(max(y, b.minY + inset), b.maxY - size.height - inset)
+
+        let preferRightAlign = ringFrame.midX > b.midX
+        var x = preferRightAlign
+            ? (ringFrame.maxX - size.width + horizontalOverlap)
+            : (ringFrame.minX - horizontalOverlap)
+        x = min(max(x, b.minX + inset), b.maxX - size.width - inset)
+        return CGPoint(x: x, y: y)
     }
 }

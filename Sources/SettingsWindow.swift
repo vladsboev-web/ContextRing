@@ -9,13 +9,16 @@ struct SettingsActions {
     let onOpenAccessibility: () -> Void
     let onChangeLaunchMode: (LaunchMode) -> Void
     let onWindowOpenChanged: (Bool) -> Void
+    let onWindowFocused: () -> Void
 }
 
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let onWindowOpenChanged: (Bool) -> Void
+    private let onWindowFocused: () -> Void
 
     init(viewModel: RingViewModel, actions: SettingsActions) {
         self.onWindowOpenChanged = actions.onWindowOpenChanged
+        self.onWindowFocused = actions.onWindowFocused
         let hosting = NSHostingView(rootView: SettingsView(viewModel: viewModel, actions: actions))
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 550, height: 720),
@@ -46,6 +49,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     func updateTitle(lang: ResolvedLanguage) {
         window?.title = L10n.settingsWindowTitle(lang)
+    }
+
+    func updateAppearance(isDark: Bool) {
+        window?.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        onWindowFocused()
     }
 
     func windowWillClose(_ notification: Notification) {

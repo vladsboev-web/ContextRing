@@ -1,6 +1,7 @@
 import ApplicationServices
 import Cocoa
 import Combine
+import Darwin
 import ServiceManagement
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -36,11 +37,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var settingsController: SettingsWindowController?
     private var statusItem: NSStatusItem?
 
-    private var dataTimer: Timer?
+    private var fileWatchers: [String: (fd: Int32, source: DispatchSourceFileSystemObject)] = [:]
+    private var fileEventWorkItem: DispatchWorkItem?
+    private var activeConversationId: String?
+
     private var hoverWorkItem: DispatchWorkItem?
     private var globalClickMonitor: Any?
     private var localKeyMonitor: Any?
     private var terminationObserver: NSObjectProtocol?
+    private var appActiveObserver: NSObjectProtocol?
+    private var accessibilityPollTimer: Timer?
 
     private var lastSnapshot: WindowSnapshot?
     private var lastKnownAntigravitySnapshot: WindowSnapshot?
@@ -48,6 +54,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isSettingsWindowOpen = false
     private var isUserInteractingWithRing = false
     private var cancellables = Set<AnyCancellable>()
+
+    private var isMonitoringActive: Bool {
+        (lastSnapshot?.isVisible == true) || isSettingsWindowOpen
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         registerDefaults()
@@ -57,26 +67,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupStatusItem()
         setupPanels()
         setupTerminationWatcher()
-        setupTracker()
+        setupAppActivationWatcher()
         refreshData(includeRecentList: true)
-
-        dataTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            let trusted = AXIsProcessTrusted()
-            if self.viewModel.accessibilityGranted != trusted {
-                self.viewModel.accessibilityGranted = trusted
-            }
-            self.refreshData(includeRecentList: self.viewModel.isDetailOpen || self.viewModel.isChatDropdownOpen)
-            if self.viewModel.isDetailOpen && self.viewModel.activeDetailTab == .stats {
-                self.refreshPeriodStats()
-            }
-        }
+        setupTracker()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        dataTimer?.invalidate()
+        stopFileWatchers()
         hoverWorkItem?.cancel()
         removeDetailMonitors()
+        accessibilityPollTimer?.invalidate()
+        accessibilityPollTimer = nil
+        if let appActiveObserver {
+            NotificationCenter.default.removeObserver(appActiveObserver)
+            self.appActiveObserver = nil
+        }
         if let terminationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(terminationObserver)
             self.terminationObserver = nil
@@ -227,9 +232,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = item
 
         viewModel.$hasTokenData
-            .combineLatest(viewModel.$stats, viewModel.$threshold)
+            .combineLatest(viewModel.$stats, viewModel.$threshold, viewModel.$selectedScope)
             .receive(on: RunLoop.main)
-            .sink { [weak self] _, _, _ in
+            .sink { [weak self] _, _, _, _ in
                 self?.updateStatusBarTitle()
             }
             .store(in: &cancellables)
@@ -280,6 +285,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             onSelectAutoMode: { [weak self] in
                 self?.selectConversation(nil)
             },
+            onCycleTheme: { [weak self] in
+                self?.cycleThemePreference()
+            },
             onSelectDetailTab: { [weak self] tab in
                 self?.selectDetailTab(tab)
             },
@@ -288,6 +296,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             },
             onSelectHistoryMode: { [weak self] mode in
                 self?.selectHistoryMode(mode)
+            },
+            onSelectChatFromStats: { [weak self] convId in
+                self?.selectConversationFromStats(convId)
             },
             onCopyHandoff: { [weak self] in
                 self?.copyHandoffPrompt()
@@ -323,6 +334,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func setupAppActivationWatcher() {
+        appActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.recheckAccessibilityTrust()
+        }
+    }
+
+    private func recheckAccessibilityTrust() {
+        let trusted = AXIsProcessTrusted()
+        if viewModel.accessibilityGranted != trusted {
+            viewModel.accessibilityGranted = trusted
+            windowTracker.refresh(forceEmit: true)
+        }
+        if trusted {
+            accessibilityPollTimer?.invalidate()
+            accessibilityPollTimer = nil
+        }
+    }
+
+    private func updateAccessibilityPollTimer() {
+        guard isSettingsWindowOpen && !viewModel.accessibilityGranted else {
+            accessibilityPollTimer?.invalidate()
+            accessibilityPollTimer = nil
+            return
+        }
+        guard accessibilityPollTimer == nil else { return }
+        accessibilityPollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.recheckAccessibilityTrust()
+        }
+    }
+
     private func setupTracker() {
         windowTracker.onUpdate = { [weak self] snapshot, trusted in
             self?.handleWindowUpdate(snapshot: snapshot, accessibilityTrusted: trusted)
@@ -330,16 +375,126 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         windowTracker.start()
     }
 
+    // MARK: - Event-Driven File Watchers
+
+    private func syncFileWatchers() {
+        guard isMonitoringActive else {
+            stopFileWatchers()
+            return
+        }
+
+        var desiredPaths = Set<String>()
+        let fm = FileManager.default
+
+        for path in [
+            dataReader.dbFilePath,
+            dataReader.dbWalFilePath,
+            dataReader.appStorageFilePath,
+            dataReader.userSettingsFilePath,
+            dataReader.brainDirectoryPath,
+        ] {
+            if fm.fileExists(atPath: path) {
+                desiredPaths.insert(path)
+            }
+        }
+        if !fm.fileExists(atPath: dataReader.dbWalFilePath) {
+            let dbDir = URL(fileURLWithPath: dataReader.dbFilePath).deletingLastPathComponent().path
+            if fm.fileExists(atPath: dbDir) {
+                desiredPaths.insert(dbDir)
+            }
+        }
+
+        if let convId = activeConversationId {
+            if let transcriptPath = dataReader.transcriptFilePath(forConversationId: convId) {
+                desiredPaths.insert(transcriptPath)
+            } else {
+                let logsDir = URL(fileURLWithPath: dataReader.brainDirectoryPath)
+                    .appendingPathComponent(convId)
+                    .appendingPathComponent(".system_generated/logs").path
+                if fm.fileExists(atPath: logsDir) {
+                    desiredPaths.insert(logsDir)
+                }
+            }
+        }
+
+        for existingPath in Array(fileWatchers.keys) where !desiredPaths.contains(existingPath) {
+            removeFileWatcher(forPath: existingPath)
+        }
+
+        for path in desiredPaths where fileWatchers[path] == nil {
+            addFileWatcher(forPath: path)
+        }
+    }
+
+    private func addFileWatcher(forPath path: String) {
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .extend, .attrib, .delete, .rename],
+            queue: .main
+        )
+        source.setCancelHandler {
+            close(fd)
+        }
+        source.setEventHandler { [weak self, weak source] in
+            guard let self, let source else { return }
+            let flags = source.data
+            if flags.contains(.delete) || flags.contains(.rename) {
+                self.removeFileWatcher(forPath: path)
+            }
+            self.scheduleFileEventRefresh()
+        }
+        fileWatchers[path] = (fd: fd, source: source)
+        source.resume()
+    }
+
+    private func removeFileWatcher(forPath path: String) {
+        guard let entry = fileWatchers.removeValue(forKey: path) else { return }
+        entry.source.cancel()
+    }
+
+    private func stopFileWatchers() {
+        fileEventWorkItem?.cancel()
+        fileEventWorkItem = nil
+        for (_, entry) in fileWatchers {
+            entry.source.cancel()
+        }
+        fileWatchers.removeAll()
+    }
+
+    private func scheduleFileEventRefresh() {
+        guard isMonitoringActive else { return }
+        fileEventWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.handleFileSystemEvent()
+        }
+        fileEventWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: item)
+    }
+
+    private func handleFileSystemEvent() {
+        guard isMonitoringActive else { return }
+        refreshData(includeRecentList: viewModel.isDetailOpen || viewModel.isChatDropdownOpen)
+        if viewModel.isDetailOpen && viewModel.activeDetailTab == .stats {
+            refreshPeriodStats()
+        }
+        syncFileWatchers()
+    }
+
     // MARK: - Hover, Detail Popover & Chat Dropdown
 
     private func handleHoverChanged(_ hovering: Bool) {
         if isUserInteractingWithRing {
-            viewModel.isHoveringRing = false
+            if viewModel.isHoveringRing { viewModel.isHoveringRing = false }
             hoverPanel?.orderOut(nil)
             return
         }
 
-        viewModel.isHoveringRing = hovering
+        if viewModel.isHoveringRing != hovering {
+            viewModel.isHoveringRing = hovering
+        }
         hoverWorkItem?.cancel()
         hoverWorkItem = nil
 
@@ -357,6 +512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   self.ringPanel?.isVisible == true else {
                 return
             }
+            self.refreshData(includeRecentList: false)
             self.hoverPanel?.show(near: ringFrame)
         }
         hoverWorkItem = item
@@ -366,7 +522,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func cancelHoverTooltip() {
         hoverWorkItem?.cancel()
         hoverWorkItem = nil
-        viewModel.isHoveringRing = false
+        if viewModel.isHoveringRing {
+            viewModel.isHoveringRing = false
+        }
         hoverPanel?.orderOut(nil)
     }
 
@@ -466,6 +624,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func selectConversation(_ conversationId: String?) {
         viewModel.manualConversationId = conversationId
         refreshData(includeRecentList: true)
+        syncFileWatchers()
+    }
+
+    private func selectConversationFromStats(_ conversationId: String) {
+        viewModel.activeDetailTab = .context
+        selectConversation(conversationId)
+    }
+
+    private func cycleThemePreference() {
+        switch viewModel.themePreference {
+        case .auto: viewModel.themePreference = .light
+        case .light: viewModel.themePreference = .dark
+        case .dark: viewModel.themePreference = .auto
+        }
+        applyAppearanceAndLayoutChange()
     }
 
     private func selectHistoryMode(_ mode: HistoryViewMode) {
@@ -501,6 +674,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func applyAppearanceAndLayoutChange() {
         saveSettings()
         settingsController?.updateTitle(lang: viewModel.resolvedLanguage)
+        settingsController?.updateAppearance(isDark: viewModel.effectiveIsDarkTheme)
         ringPanel?.updatePanelSize(viewModel.effectivePanelSize)
         if let snapshot = currentPositionSnapshot(), !isUserInteractingWithRing {
             positionRing(inside: snapshot)
@@ -521,7 +695,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             viewModel.sendButtonLocateStatus = L10n.statusNeedAccessibility(lang)
             return
         }
-        guard let snapshot = lastKnownAntigravitySnapshot ?? findAnyAntigravitySnapshot() else {
+        guard let snapshot = lastKnownAntigravitySnapshot ?? windowTracker.findAnyAntigravitySnapshot() else {
             viewModel.sendButtonLocateStatus = L10n.statusWindowNotFound(lang)
             return
         }
@@ -547,44 +721,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             viewModel.sendButtonLocateStatus = L10n.statusSendNotExposed(lang)
         }
-    }
-
-    private func findAnyAntigravitySnapshot() -> WindowSnapshot? {
-        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: AntigravityWindowTracker.targetBundleId).first else {
-            return nil
-        }
-        let pid = app.processIdentifier
-        let opts: CGWindowListOption = [.optionAll, .excludeDesktopElements]
-        guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
-            return nil
-        }
-        let primaryHeight = NSScreen.screens.first?.frame.height ?? 900
-        for item in list {
-            guard (item[kCGWindowOwnerPID as String] as? pid_t) == pid,
-                  (item[kCGWindowLayer as String] as? Int ?? -1) == 0,
-                  let dict = item[kCGWindowBounds as String] as? NSDictionary,
-                  let qr = CGRect(dictionaryRepresentation: dict),
-                  qr.width >= 200, qr.height >= 150 else {
-                continue
-            }
-            let cocoaFrame = CGRect(
-                x: qr.origin.x,
-                y: primaryHeight - qr.origin.y - qr.height,
-                width: qr.width,
-                height: qr.height
-            )
-            let isFS = NSScreen.screens.contains {
-                abs($0.frame.width - cocoaFrame.width) <= 4 && abs($0.frame.height - cocoaFrame.height) <= 4
-            }
-            return WindowSnapshot(
-                frame: cocoaFrame,
-                title: (item[kCGWindowName as String] as? String) ?? "",
-                isFullScreen: isFS,
-                isVisible: true,
-                pid: pid
-            )
-        }
-        return nil
     }
 
     private func changeLaunchMode(_ newMode: LaunchMode) {
@@ -629,49 +765,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             viewModel.accessibilityGranted = accessibilityTrusted
         }
 
+        let previousSnapshot = lastSnapshot
+        let wasRingVisible = ringPanel?.isVisible == true
         lastSnapshot = snapshot
 
         if let snapshot, snapshot.isVisible {
+            let becameVisible = !(previousSnapshot?.isVisible == true) || !wasRingVisible
             lastKnownAntigravitySnapshot = snapshot
-            viewModel.activeWindowTitle = snapshot.title
-            viewModel.isFullScreen = snapshot.isFullScreen
+
+            if viewModel.activeWindowTitle != snapshot.title {
+                viewModel.activeWindowTitle = snapshot.title
+            }
+            if viewModel.isFullScreen != snapshot.isFullScreen {
+                viewModel.isFullScreen = snapshot.isFullScreen
+            }
 
             if !snapshot.title.isEmpty && snapshot.title != lastAntigravityWindowTitle {
                 lastAntigravityWindowTitle = snapshot.title
                 if viewModel.manualConversationId != nil {
                     viewModel.manualConversationId = nil
                 }
-                refreshData(includeRecentList: true)
+                refreshData(includeRecentList: viewModel.isDetailOpen || viewModel.isChatDropdownOpen)
+            } else if becameVisible {
+                refreshData(includeRecentList: viewModel.isDetailOpen || viewModel.isChatDropdownOpen)
+                if viewModel.isDetailOpen && viewModel.activeDetailTab == .stats {
+                    refreshPeriodStats()
+                }
             }
 
-            ringPanel?.updatePanelSize(viewModel.effectivePanelSize)
-            if !isUserInteractingWithRing {
+            let targetSize = viewModel.effectivePanelSize
+            let sizeChanged = ringPanel.map {
+                abs($0.frame.width - targetSize.width) > 0.5 || abs($0.frame.height - targetSize.height) > 0.5
+            } ?? false
+            let geometryChanged = (previousSnapshot?.frame != snapshot.frame)
+                || (previousSnapshot?.isFullScreen != snapshot.isFullScreen)
+                || becameVisible
+                || sizeChanged
+
+            if sizeChanged {
+                ringPanel?.updatePanelSize(targetSize)
+            }
+            if geometryChanged && !isUserInteractingWithRing {
                 positionRing(inside: snapshot)
             }
-            ringPanel?.orderFrontRegardless()
-
-            if viewModel.isDetailOpen, let ringFrame = ringPanel?.frame {
+            if becameVisible || geometryChanged {
+                ringPanel?.orderFrontRegardless()
+            }
+            if geometryChanged && viewModel.isDetailOpen, let ringFrame = ringPanel?.frame {
                 detailPanel?.reposition(near: ringFrame)
             }
+
+            syncFileWatchers()
             return
         }
 
         if isSettingsWindowOpen,
            NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Bundle.main.bundleIdentifier,
-           let anchorSnapshot = lastKnownAntigravitySnapshot ?? findAnyAntigravitySnapshot() {
+           let anchorSnapshot = lastKnownAntigravitySnapshot ?? windowTracker.findAnyAntigravitySnapshot() {
             ringPanel?.updatePanelSize(viewModel.effectivePanelSize)
             if !isUserInteractingWithRing {
                 positionRing(inside: anchorSnapshot)
             }
             ringPanel?.orderFrontRegardless()
+            syncFileWatchers()
             return
         }
 
         isUserInteractingWithRing = false
-        viewModel.isFullScreen = false
+        if viewModel.isFullScreen {
+            viewModel.isFullScreen = false
+        }
         cancelHoverTooltip()
         closeDetailPanel()
-        ringPanel?.orderOut(nil)
+        if wasRingVisible {
+            ringPanel?.orderOut(nil)
+        }
+        stopFileWatchers()
     }
 
     private func currentPositionSnapshot() -> WindowSnapshot? {
@@ -679,7 +848,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return lastSnapshot
         }
         if isSettingsWindowOpen {
-            return lastKnownAntigravitySnapshot ?? findAnyAntigravitySnapshot()
+            return lastKnownAntigravitySnapshot ?? windowTracker.findAnyAntigravitySnapshot()
         }
         return nil
     }
@@ -688,6 +857,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let appState = dataReader.readAppState()
         if viewModel.isDarkTheme != appState.isDarkTheme {
             viewModel.isDarkTheme = appState.isDarkTheme
+            settingsController?.updateAppearance(isDark: viewModel.effectiveIsDarkTheme)
         }
         if viewModel.zoomLevel != appState.zoomLevel {
             viewModel.zoomLevel = appState.zoomLevel
@@ -707,42 +877,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        let previousConvId = activeConversationId
+
         if let manualId = viewModel.manualConversationId {
+            activeConversationId = manualId
             let titleHint = viewModel.recentConversations.first(where: { $0.id == manualId })?.title ?? ""
             if let stats = dataReader.readTranscriptStats(conversationId: manualId, fallbackTitle: titleHint),
                stats.totalModelSteps > 0 {
-                viewModel.stats = stats
-                viewModel.activeChatTitle = stats.title
-                viewModel.hasTokenData = true
+                applyStatsToViewModel(stats: stats, activeTitle: stats.title, hasData: true)
             } else {
-                viewModel.stats = nil
-                viewModel.activeChatTitle = !titleHint.isEmpty ? titleHint : String(manualId.prefix(8))
-                viewModel.hasTokenData = false
-            }
-            return
-        }
-
-        let titleHint = !viewModel.activeWindowTitle.isEmpty
-            ? viewModel.activeWindowTitle
-            : (lastKnownAntigravitySnapshot?.title ?? "")
-
-        if let resolved = dataReader.resolveConversationId(forWindowTitle: titleHint) {
-            if let stats = dataReader.readTranscriptStats(conversationId: resolved.id, fallbackTitle: resolved.title),
-               stats.totalModelSteps > 0 {
-                viewModel.stats = stats
-                viewModel.activeChatTitle = stats.title
-                viewModel.hasTokenData = true
-            } else {
-                viewModel.stats = nil
-                viewModel.activeChatTitle = !resolved.title.isEmpty
-                    ? resolved.title
-                    : AntigravityDataReader.cleanWindowTitle(titleHint)
-                viewModel.hasTokenData = false
+                let fallback = !titleHint.isEmpty ? titleHint : String(manualId.prefix(8))
+                applyStatsToViewModel(stats: nil, activeTitle: fallback, hasData: false)
             }
         } else {
-            viewModel.stats = nil
-            viewModel.activeChatTitle = AntigravityDataReader.cleanWindowTitle(titleHint)
-            viewModel.hasTokenData = false
+            let titleHint = !viewModel.activeWindowTitle.isEmpty
+                ? viewModel.activeWindowTitle
+                : (lastKnownAntigravitySnapshot?.title ?? "")
+
+            if let resolved = dataReader.resolveConversationId(forWindowTitle: titleHint) {
+                activeConversationId = resolved.id
+                if let stats = dataReader.readTranscriptStats(conversationId: resolved.id, fallbackTitle: resolved.title),
+                   stats.totalModelSteps > 0 {
+                    applyStatsToViewModel(stats: stats, activeTitle: stats.title, hasData: true)
+                } else {
+                    let fallback = !resolved.title.isEmpty
+                        ? resolved.title
+                        : AntigravityDataReader.cleanWindowTitle(titleHint)
+                    applyStatsToViewModel(stats: nil, activeTitle: fallback, hasData: false)
+                }
+            } else {
+                activeConversationId = nil
+                applyStatsToViewModel(
+                    stats: nil,
+                    activeTitle: AntigravityDataReader.cleanWindowTitle(titleHint),
+                    hasData: false
+                )
+            }
+        }
+
+        if isMonitoringActive && previousConvId != activeConversationId {
+            syncFileWatchers()
+        }
+    }
+
+    private func applyStatsToViewModel(stats: TranscriptStats?, activeTitle: String, hasData: Bool) {
+        let conversationChanged = viewModel.stats?.conversationId != stats?.conversationId
+        if conversationChanged && viewModel.selectedScope != .allChat {
+            viewModel.selectedScope = .allChat
+        }
+        if viewModel.stats != stats {
+            viewModel.stats = stats
+        }
+        if viewModel.activeChatTitle != activeTitle {
+            viewModel.activeChatTitle = activeTitle
+        }
+        if viewModel.hasTokenData != hasData {
+            viewModel.hasTokenData = hasData
         }
     }
 
@@ -850,6 +1040,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if viewModel.accessibilityGranted != trusted {
             viewModel.accessibilityGranted = trusted
         }
+        refreshData(includeRecentList: false)
 
         let lang = viewModel.resolvedLanguage
         let chatTitle = !viewModel.activeChatTitle.isEmpty
@@ -891,6 +1082,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settingsItem.target = self
         menu.addItem(settingsItem)
 
+        let languageMenu = NSMenu()
+        for pref in AppLanguagePreference.allCases {
+            let langOption = NSMenuItem(
+                title: L10n.languagePreferenceName(pref, lang: lang),
+                action: #selector(selectLanguageFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            langOption.target = self
+            langOption.representedObject = pref.rawValue
+            langOption.state = (viewModel.languagePreference == pref) ? .on : .off
+            languageMenu.addItem(langOption)
+        }
+        let languageItem = NSMenuItem(title: L10n.menuLanguage(lang), action: nil, keyEquivalent: "")
+        languageItem.submenu = languageMenu
+        menu.addItem(languageItem)
+
         if !viewModel.accessibilityGranted {
             let axItem = NSMenuItem(
                 title: L10n.menuGrantAccessibility(lang),
@@ -920,6 +1127,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(quitItem)
     }
 
+    @objc private func selectLanguageFromMenu(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let pref = AppLanguagePreference(rawValue: raw) else {
+            return
+        }
+        viewModel.languagePreference = pref
+        applyAppearanceAndLayoutChange()
+    }
+
     @objc private func openSettingsWindow() {
         let trusted = AXIsProcessTrusted()
         if viewModel.accessibilityGranted != trusted {
@@ -947,15 +1163,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self?.changeLaunchMode(mode)
                 },
                 onWindowOpenChanged: { [weak self] isOpen in
-                    self?.isSettingsWindowOpen = isOpen
-                    if !isOpen {
-                        self?.windowTracker.refresh()
+                    guard let self else { return }
+                    self.isSettingsWindowOpen = isOpen
+                    if isOpen {
+                        self.recheckAccessibilityTrust()
+                        self.refreshData(includeRecentList: false)
+                        self.syncFileWatchers()
+                    } else {
+                        self.windowTracker.refresh(forceEmit: true)
                     }
+                    self.updateAccessibilityPollTimer()
+                },
+                onWindowFocused: { [weak self] in
+                    self?.recheckAccessibilityTrust()
                 }
             )
             settingsController = SettingsWindowController(viewModel: viewModel, actions: actions)
         }
+        recheckAccessibilityTrust()
+        updateAccessibilityPollTimer()
         settingsController?.updateTitle(lang: viewModel.resolvedLanguage)
+        settingsController?.updateAppearance(isDark: viewModel.effectiveIsDarkTheme)
         settingsController?.showWindowAndActivate()
     }
 

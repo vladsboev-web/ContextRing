@@ -8,7 +8,8 @@ final class AntigravityWindowTracker {
     var onUpdate: ((WindowSnapshot?, Bool) -> Void)?
 
     private var workspaceObservers: [NSObjectProtocol] = []
-    private var pollTimer: Timer?
+    private var defaultCenterObservers: [NSObjectProtocol] = []
+    private var fallbackPollTimer: Timer?
 
     private var observedPid: pid_t = 0
     private var axObserver: AXObserver?
@@ -16,13 +17,16 @@ final class AntigravityWindowTracker {
     private var observedWindowElement: AXUIElement?
     private var lastTrustedState: Bool = AXIsProcessTrusted()
 
+    private var lastEmittedSnapshot: WindowSnapshot?
+    private var lastEmittedTrusted: Bool?
+
     deinit {
         stop()
     }
 
     func start() {
-        let center = NSWorkspace.shared.notificationCenter
-        let names: [NSNotification.Name] = [
+        let wsCenter = NSWorkspace.shared.notificationCenter
+        let wsNames: [NSNotification.Name] = [
             NSWorkspace.didActivateApplicationNotification,
             NSWorkspace.didDeactivateApplicationNotification,
             NSWorkspace.activeSpaceDidChangeNotification,
@@ -32,31 +36,42 @@ final class AntigravityWindowTracker {
             NSWorkspace.didUnhideApplicationNotification,
         ]
 
-        for name in names {
-            let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+        for name in wsNames {
+            let token = wsCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 self?.refresh()
             }
             workspaceObservers.append(token)
         }
 
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+        let screenToken = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
             self?.refresh()
         }
-        refresh()
+        defaultCenterObservers.append(screenToken)
+
+        refresh(forceEmit: true)
     }
 
     func stop() {
-        let center = NSWorkspace.shared.notificationCenter
+        let wsCenter = NSWorkspace.shared.notificationCenter
         for token in workspaceObservers {
-            center.removeObserver(token)
+            wsCenter.removeObserver(token)
         }
         workspaceObservers.removeAll()
-        pollTimer?.invalidate()
-        pollTimer = nil
+
+        for token in defaultCenterObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
+        defaultCenterObservers.removeAll()
+
+        stopFallbackPollTimer()
         teardownAXObserver()
     }
 
-    func refresh() {
+    func refresh(forceEmit: Bool = false) {
         let trusted = AXIsProcessTrusted()
         if trusted != lastTrustedState {
             lastTrustedState = trusted
@@ -68,26 +83,45 @@ final class AntigravityWindowTracker {
         guard let frontApp = NSWorkspace.shared.frontmostApplication,
               frontApp.bundleIdentifier == Self.targetBundleId,
               !frontApp.isHidden else {
-            onUpdate?(nil, trusted)
+            stopFallbackPollTimer()
+            emitIfChanged(snapshot: nil, trusted: trusted, force: forceEmit)
             return
         }
 
         let pid = frontApp.processIdentifier
         if trusted {
             ensureAXObserver(for: pid)
+            if axObserver != nil {
+                stopFallbackPollTimer()
+            } else {
+                startFallbackPollTimer()
+            }
+
+            if let axSnapshot = readAXSnapshot(for: pid) {
+                if !axSnapshot.isVisible {
+                    emitIfChanged(snapshot: nil, trusted: trusted, force: forceEmit)
+                    return
+                }
+                if axSnapshot.title.isEmpty, let cgWin = findOnScreenMainCGWindow(for: pid), !cgWin.title.isEmpty {
+                    let enriched = WindowSnapshot(
+                        frame: axSnapshot.frame,
+                        title: cgWin.title,
+                        isFullScreen: axSnapshot.isFullScreen,
+                        isVisible: axSnapshot.isVisible,
+                        pid: axSnapshot.pid
+                    )
+                    emitIfChanged(snapshot: enriched, trusted: trusted, force: forceEmit)
+                } else {
+                    emitIfChanged(snapshot: axSnapshot, trusted: trusted, force: forceEmit)
+                }
+                return
+            }
+        } else {
+            startFallbackPollTimer()
         }
 
         guard let cgWindow = findOnScreenMainCGWindow(for: pid) else {
-            onUpdate?(nil, trusted)
-            return
-        }
-
-        if trusted, let axSnapshot = readAXSnapshot(for: pid, fallbackCGTitle: cgWindow.title) {
-            if !axSnapshot.isVisible {
-                onUpdate?(nil, trusted)
-                return
-            }
-            onUpdate?(axSnapshot, trusted)
+            emitIfChanged(snapshot: nil, trusted: trusted, force: forceEmit)
             return
         }
 
@@ -99,7 +133,61 @@ final class AntigravityWindowTracker {
             isVisible: true,
             pid: pid
         )
+        emitIfChanged(snapshot: snapshot, trusted: trusted, force: forceEmit)
+    }
+
+    func findAnyAntigravitySnapshot() -> WindowSnapshot? {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: Self.targetBundleId).first else {
+            return nil
+        }
+        let pid = app.processIdentifier
+        let opts: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+        guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+
+        for item in list {
+            guard (item[kCGWindowOwnerPID as String] as? pid_t) == pid,
+                  (item[kCGWindowLayer as String] as? Int ?? -1) == 0,
+                  let dict = item[kCGWindowBounds as String] as? NSDictionary,
+                  let qr = CGRect(dictionaryRepresentation: dict),
+                  qr.width >= 200, qr.height >= 150 else {
+                continue
+            }
+            let cocoaFrame = Self.quartzToCocoaRect(qr)
+            let isFS = Self.matchesScreenFrame(cocoaFrame)
+            return WindowSnapshot(
+                frame: cocoaFrame,
+                title: (item[kCGWindowName as String] as? String) ?? "",
+                isFullScreen: isFS,
+                isVisible: true,
+                pid: pid
+            )
+        }
+        return nil
+    }
+
+    // MARK: - Emission & Fallback Timer
+
+    private func emitIfChanged(snapshot: WindowSnapshot?, trusted: Bool, force: Bool) {
+        if !force, lastEmittedTrusted == trusted, lastEmittedSnapshot == snapshot {
+            return
+        }
+        lastEmittedSnapshot = snapshot
+        lastEmittedTrusted = trusted
         onUpdate?(snapshot, trusted)
+    }
+
+    private func startFallbackPollTimer() {
+        guard fallbackPollTimer == nil else { return }
+        fallbackPollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
+    private func stopFallbackPollTimer() {
+        fallbackPollTimer?.invalidate()
+        fallbackPollTimer = nil
     }
 
     // MARK: - Accessibility Observer
@@ -197,7 +285,7 @@ final class AntigravityWindowTracker {
 
     // MARK: - Window Inspection
 
-    private func readAXSnapshot(for pid: pid_t, fallbackCGTitle: String) -> WindowSnapshot? {
+    private func readAXSnapshot(for pid: pid_t) -> WindowSnapshot? {
         let appElement = observedAppElement ?? AXUIElementCreateApplication(pid)
         guard let windowElement = copyElementAttribute(appElement, attribute: kAXFocusedWindowAttribute)
                 ?? copyElementAttribute(appElement, attribute: kAXMainWindowAttribute) else {
@@ -216,13 +304,12 @@ final class AntigravityWindowTracker {
 
         let cocoaFrame = Self.quartzToCocoaRect(CGRect(origin: quartzPos, size: size))
         let axTitle = copyStringAttribute(windowElement, attribute: kAXTitleAttribute) ?? ""
-        let title = !axTitle.isEmpty ? axTitle : fallbackCGTitle
         let isFS = copyBoolAttribute(windowElement, attribute: "AXFullScreen")
             ?? Self.matchesScreenFrame(cocoaFrame)
 
         return WindowSnapshot(
             frame: cocoaFrame,
-            title: title,
+            title: axTitle,
             isFullScreen: isFS,
             isVisible: true,
             pid: pid
@@ -351,7 +438,7 @@ final class AntigravityWindowTracker {
               CFGetTypeID(value) == AXUIElementGetTypeID() else {
             return nil
         }
-        return (value as! AXUIElement)
+        return unsafeBitCast(value, to: AXUIElement.self)
     }
 
     private func copyStringAttribute(_ element: AXUIElement, attribute: String) -> String? {
@@ -377,7 +464,7 @@ final class AntigravityWindowTracker {
               CFGetTypeID(value) == AXValueGetTypeID() else {
             return nil
         }
-        let axVal = value as! AXValue
+        let axVal = unsafeBitCast(value, to: AXValue.self)
         var point = CGPoint.zero
         guard AXValueGetValue(axVal, .cgPoint, &point) else { return nil }
         return point
@@ -390,7 +477,7 @@ final class AntigravityWindowTracker {
               CFGetTypeID(value) == AXValueGetTypeID() else {
             return nil
         }
-        let axVal = value as! AXValue
+        let axVal = unsafeBitCast(value, to: AXValue.self)
         var size = CGSize.zero
         guard AXValueGetValue(axVal, .cgSize, &size) else { return nil }
         return size

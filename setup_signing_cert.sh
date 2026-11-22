@@ -63,7 +63,7 @@ security import "$P12_FILE" \
 
 echo "Trusting '$CERT_NAME' for code signing (macOS may prompt for your login password)..."
 security add-trusted-cert \
-  -d -r trustRoot \
+  -r trustRoot \
   -p codeSign \
   -k "$KEYCHAIN_PATH" \
   "$CRT_FILE"

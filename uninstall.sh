@@ -84,15 +84,44 @@ if [ -f "$AGENT_PLIST" ]; then
   msg "Removed LaunchAgent: $AGENT_PLIST" "Удалён LaunchAgent: $AGENT_PLIST"
 fi
 
-if [ -d "$TARGET_APP" ]; then
-  if [ -w "/Applications" ] && [ -w "$TARGET_APP" ]; then
-    rm -rf "$TARGET_APP"
-  else
-    sudo rm -rf "$TARGET_APP"
+USER_APP="$HOME/Applications/ContextRing.app"
+REMOVED_ANY=false
+
+admin_remove() {
+  local dst="$1"
+  local dst_escaped="${dst//\'/\'\\\'\'}"
+  local cmd="rm -rf '${dst_escaped}'"
+
+  if command -v osascript >/dev/null 2>&1; then
+    if osascript -e 'on run argv' -e 'do shell script (item 1 of argv) with administrator privileges' -e 'end run' "$cmd" >/dev/null 2>&1; then
+      return 0
+    fi
   fi
-  msg "Removed app: $TARGET_APP" "Удалено приложение: $TARGET_APP"
-else
-  msg "App not found at $TARGET_APP" "Приложение не найдено в $TARGET_APP"
+
+  if id -Gn 2>/dev/null | grep -qw admin; then
+    sudo rm -rf "$dst"
+    return $?
+  fi
+
+  return 1
+}
+
+for APP_PATH in "$TARGET_APP" "$USER_APP"; do
+  if [ -d "$APP_PATH" ]; then
+    APP_PARENT="$(dirname "$APP_PATH")"
+    if [ -w "$APP_PARENT" ] && [ -w "$APP_PATH" ]; then
+      rm -rf "$APP_PATH"
+    else
+      msg "Administrator privileges required to remove $APP_PATH..." "Для удаления $APP_PATH требуются права администратора..."
+      admin_remove "$APP_PATH"
+    fi
+    msg "Removed app: $APP_PATH" "Удалено приложение: $APP_PATH"
+    REMOVED_ANY=true
+  fi
+done
+
+if [ "$REMOVED_ANY" = false ]; then
+  msg "App not found at $TARGET_APP or $USER_APP" "Приложение не найдено в $TARGET_APP или $USER_APP"
 fi
 
 if [ "$PURGE_PREFS" = true ]; then

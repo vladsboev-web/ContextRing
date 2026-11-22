@@ -18,8 +18,12 @@ enum LaunchAgentManager {
     static func install(appBundlePath: String, onlyIfChanged: Bool = false) throws {
         let plistData = try buildPlistData(appBundlePath: appBundlePath)
         let url = plistURL
+        let uid = getuid()
 
-        if onlyIfChanged, let existing = try? Data(contentsOf: url), existing == plistData {
+        if onlyIfChanged,
+           let existing = try? Data(contentsOf: url),
+           existing == plistData,
+           isLoadedInLaunchctl(uid: uid) {
             return
         }
 
@@ -27,7 +31,6 @@ enum LaunchAgentManager {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try plistData.write(to: url, options: [.atomic])
 
-        let uid = getuid()
         _ = runLaunchctl(["bootout", "gui/\(uid)/\(label)"])
 
         let boot = runLaunchctl(["bootstrap", "gui/\(uid)", url.path])
@@ -50,6 +53,10 @@ enum LaunchAgentManager {
         try? FileManager.default.removeItem(at: plistURL)
     }
 
+    private static func isLoadedInLaunchctl(uid: uid_t) -> Bool {
+        runLaunchctl(["print", "gui/\(uid)/\(label)"]).status == 0
+    }
+
     private static func buildPlistData(appBundlePath: String) throws -> Data {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let supportDir = "\(home)/Library/Application Support/Antigravity"
@@ -59,6 +66,7 @@ enum LaunchAgentManager {
         if /usr/bin/lsappinfo find bundleid=com.google.antigravity 2>/dev/null | /usr/bin/grep -q '^ASN:' && ! /usr/bin/lsappinfo find bundleid=com.vladsboev.contextring 2>/dev/null | /usr/bin/grep -q '^ASN:'; then
           APP='\(escapedBundle)'
           [ -d "$APP" ] || APP='/Applications/ContextRing.app'
+          [ -d "$APP" ] || APP="$HOME/Applications/ContextRing.app"
           [ -d "$APP" ] && /usr/bin/open -g "$APP"
         fi
         """
@@ -70,6 +78,7 @@ enum LaunchAgentManager {
                 "\(supportDir)/SingletonLock",
                 "\(supportDir)/window_state.json",
                 "\(supportDir)/Preferences",
+                "\(supportDir)/app_storage.json",
             ],
             "RunAtLoad": true,
             "ThrottleInterval": 5,
@@ -93,8 +102,8 @@ enum LaunchAgentManager {
 
         do {
             try proc.run()
-            proc.waitUntilExit()
             let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
             let errText = String(data: data, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return (proc.terminationStatus, errText)
