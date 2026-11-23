@@ -5,7 +5,7 @@
     <a href="README.md">🇬🇧 English</a> &nbsp;|&nbsp; <strong>🇷🇺 Русский</strong>
   </p>
   <p>
-    <a href="https://github.com/vladsboev-web/ContextRing/releases"><img src="https://img.shields.io/badge/version-1.1.0-orange" alt="Версия 1.1.0" /></a>
+    <a href="https://github.com/vladsboev-web/ContextRing/releases"><img src="https://img.shields.io/badge/version-1.1.1-orange" alt="Версия 1.1.1" /></a>
     <a href="https://github.com/vladsboev-web/ContextRing"><img src="https://img.shields.io/badge/macOS-13%2B%20(Universal%20arm64%20%2B%20x86__64)-black" alt="macOS 13+ Universal" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="Лицензия: MIT" /></a>
   </p>
@@ -117,6 +117,14 @@ brew install --cask contextring
 ```bash
 brew upgrade --cask contextring
 brew uninstall --cask contextring
+```
+
+### Готовая сборка без компиляции (`.dmg` / `.zip`)
+
+Скачай готовый `ContextRing-v1.1.1-macos-universal.dmg` или `.zip` из раздела **[GitHub Releases](https://github.com/vladsboev-web/ContextRing/releases/latest)**, перетащи `ContextRing.app` в «Программы» (`/Applications` или `~/Applications`). Если при первом запуске macOS попросит снять карантин (ad-hoc сборка без платного Developer ID), выполни:
+
+```bash
+xattr -cr /Applications/ContextRing.app
 ```
 
 ### Сборка и установка из исходников

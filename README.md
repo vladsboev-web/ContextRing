@@ -5,7 +5,7 @@
     <strong>🇬🇧 English</strong> &nbsp;|&nbsp; <a href="README.ru.md">🇷🇺 Русский</a>
   </p>
   <p>
-    <a href="https://github.com/vladsboev-web/ContextRing/releases"><img src="https://img.shields.io/badge/version-1.1.0-orange" alt="Version 1.1.0" /></a>
+    <a href="https://github.com/vladsboev-web/ContextRing/releases"><img src="https://img.shields.io/badge/version-1.1.1-orange" alt="Version 1.1.1" /></a>
     <a href="https://github.com/vladsboev-web/ContextRing"><img src="https://img.shields.io/badge/macOS-13%2B%20(Universal%20arm64%20%2B%20x86__64)-black" alt="macOS 13+ Universal" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT" /></a>
   </p>
@@ -117,6 +117,14 @@ Update / uninstall with Homebrew:
 ```bash
 brew upgrade --cask contextring
 brew uninstall --cask contextring
+```
+
+### Download Prebuilt App (No Build Tools Needed)
+
+Download `ContextRing-v1.1.1-macos-universal.dmg` or `.zip` directly from **[GitHub Releases](https://github.com/vladsboev-web/ContextRing/releases/latest)**, move `ContextRing.app` into `/Applications` (or `~/Applications`), and if macOS shows a quarantine prompt on first launch (unsigned/ad-hoc build), run:
+
+```bash
+xattr -cr /Applications/ContextRing.app
 ```
 
 ### Build & Install from Source
