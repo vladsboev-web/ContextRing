@@ -1,0 +1,97 @@
+name: Build and Release ContextRing
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.1.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version & tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build Universal Binary (arm64 + x86_64)
+        run: |
+          chmod +x build.sh
+          ./build.sh --universal
+          codesign --force --deep --sign - build/ContextRing.app
+          codesign --verify --deep --strict build/ContextRing.app
+          ARCHS="$(lipo -archs build/ContextRing.app/Contents/MacOS/ContextRing)"
+          echo "Built architectures: $ARCHS"
+          test -d build/ContextRing.app
+
+      - name: Package .zip and .dmg
+        id: pkg
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          mkdir -p dist/dmg_root
+          ditto -c -k --sequesterRsrc --keepParent build/ContextRing.app "dist/ContextRing-${TAG}-macos-universal.zip"
+          cp -R build/ContextRing.app dist/dmg_root/ContextRing.app
+          ln -s /Applications dist/dmg_root/Applications
+          hdiutil create -volname "ContextRing ${VERSION}" -srcfolder dist/dmg_root -ov -format UDZO "dist/ContextRing-${TAG}-macos-universal.dmg"
+          ZIP_SHA="$(shasum -a 256 "dist/ContextRing-${TAG}-macos-universal.zip" | awk '{print $1}')"
+          DMG_SHA="$(shasum -a 256 "dist/ContextRing-${TAG}-macos-universal.dmg" | awk '{print $1}')"
+          echo "zip_sha=$ZIP_SHA" >> "$GITHUB_OUTPUT"
+          echo "dmg_sha=$DMG_SHA" >> "$GITHUB_OUTPUT"
+          ls -lh dist/
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          ZIP_FILE="dist/ContextRing-${TAG}-macos-universal.zip"
+          DMG_FILE="dist/ContextRing-${TAG}-macos-universal.dmg"
+          NOTES_FILE="dist/release_notes.md"
+          cat > "$NOTES_FILE" <<EOF
+          ## ContextRing ${TAG} (Universal: arm64 + x86_64)
+
+          ### Install / Upgrade via Homebrew
+          \`\`\`bash
+          brew install --cask vladsboev-web/tap/contextring
+          # or upgrade:
+          brew upgrade --cask contextring
+          \`\`\`
+
+          ### Direct Download (No Build Tools Needed)
+          Download \`$(basename "$DMG_FILE")\` or \`$(basename "$ZIP_FILE")\` below.
+          If macOS shows a quarantine prompt on first launch (ad-hoc build), run:
+          \`\`\`bash
+          xattr -cr /Applications/ContextRing.app
+          \`\`\`
+
+          ### Checksums (SHA-256)
+          - \`$(basename "$ZIP_FILE")\`: \`${{ steps.pkg.outputs.zip_sha }}\`
+          - \`$(basename "$DMG_FILE")\`: \`${{ steps.pkg.outputs.dmg_sha }}\`
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file "$NOTES_FILE"
+            gh release upload "$TAG" "$ZIP_FILE" "$DMG_FILE" --clobber
+          else
+            gh release create "$TAG" "$ZIP_FILE" "$DMG_FILE" --title "$TAG" --notes-file "$NOTES_FILE"
+          fi
